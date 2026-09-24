@@ -1,0 +1,23 @@
+services:
+  gauge-blocks:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gauge-block-allocator:latest
+    # Configurable access port:
+    #   PORT=9090 docker compose up            (host port, default 8000)
+    #   CONTAINER_PORT=8080 PORT=9090 ...      (also remap listen port)
+    ports:
+      - "${PORT:-8000}:${CONTAINER_PORT:-8000}"
+    environment:
+      UVICORN_PORT: "${CONTAINER_PORT:-8000}"
+      SOLVER_TIMEOUT: "${SOLVER_TIMEOUT:-20}"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'curl -fsS "http://127.0.0.1:$${UVICORN_PORT:-8000}/health" || exit 1'
+      interval: 10s
+      timeout: 4s
+      retries: 5
+      start_period: 8s
+    restart: unless-stopped

@@ -1,0 +1,8 @@
+**/node_modules
+**/dist
+backend/app/bin/solver
+backend/app/static
+.venv
+__pycache__
+*.pyc
+.git
