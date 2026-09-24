@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Single entry point: `verify`.
+#
+# Runs, in order, and exits non-zero on the first failure:
+#   1. backend code tests (exact solver oracle cross-checks + API tests)
+#   2. build checks:
+#        - Python byte-compile / import of the FastAPI app
+#        - production frontend build (vite -> backend/static)
+#        - Docker image build if a Docker daemon is available, otherwise a
+#          local-equivalent check plus docker-compose configuration parse
+#   3. a REAL HTTP smoke test against a booted uvicorn server, covering the
+#      gauge-block preemption counterexample and the no-solution boundary
+#
+# Environment knobs:
+#   APP_PORT     port used for the smoke-test server (default 8000)
+#   SKIP_DOCKER  set to 1 to never invoke docker even if present
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+APP_PORT="${APP_PORT:-8000}"
+VENV="$ROOT/.venv"
+SMOKE_LOG="$(mktemp)"
+SERVER_PID=""
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+info()  { printf '\033[36m[verify]\033[0m %s\n' "$*"; }
+
+cleanup() {
+  if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -f "$SMOKE_LOG"
+}
+trap cleanup EXIT
+
+fail() { red "FAILED: $*"; exit 1; }
+step() { info "=== $* ==="; }
+
+# ---------------------------------------------------------------------------
+step "1/4 backend environment + code tests"
+if [ ! -x "$VENV/bin/python" ]; then
+  info "creating virtualenv at $VENV"
+  python3 -m venv "$VENV" || fail "venv creation"
+fi
+# shellcheck disable=SC1091
+"$VENV/bin/pip" install -q --upgrade pip >/dev/null 2>&1 || true
+"$VENV/bin/pip" install -q -r "$ROOT/backend/requirements-dev.txt" \
+  || fail "installing backend dependencies"
+
+PYTHONPATH="$ROOT/backend" "$VENV/bin/python" -m pytest "$ROOT/backend/tests" -q \
+  || fail "code tests"
+green "code tests passed"
+
+# ---------------------------------------------------------------------------
+step "2/4 backend import/compile build check"
+PYTHONPATH="$ROOT/backend" "$VENV/bin/python" -m compileall -q "$ROOT/backend/app" \
+  || fail "byte-compile"
+PYTHONPATH="$ROOT/backend" "$VENV/bin/python" -c "from app.main import app; print('fastapi app import ok')" \
+  || fail "FastAPI app import"
+
+# ---------------------------------------------------------------------------
+step "3/4 frontend production build"
+( cd "$ROOT/frontend" || exit 1
+  export npm_config_cache="$ROOT/.npm-cache"
+  mkdir -p "$npm_config_cache"
+  if [ ! -d node_modules ]; then
+    npm install --no-audit --no-fund || exit 1
+  fi
+  npm run build || exit 1
+) || fail "frontend production build"
+[ -f "$ROOT/backend/static/index.html" ] || fail "frontend artifact missing"
+green "frontend build ok -> backend/static"
+
+# Docker build / compose validation (daemon-dependent)
+if [ "${SKIP_DOCKER:-0}" = "1" ]; then
+  info "SKIP_DOCKER=1, skipping docker build"
+elif docker info >/dev/null 2>&1; then
+  step "3b/4 docker image build"
+  docker build -t gauge-block-allocation:verify "$ROOT" || fail "docker build"
+  if docker compose version >/dev/null 2>&1; then
+    ( cd "$ROOT" && APP_PORT="$APP_PORT" docker compose config -q ) \
+      || fail "docker compose config validation"
+    green "docker image + compose config ok"
+  fi
+else
+  info "no docker daemon: validating compose file locally instead of image build"
+  "$VENV/bin/pip" install -q pyyaml >/dev/null 2>&1 || true
+  PYTHONPATH="$ROOT/backend" "$VENV/bin/python" - "$ROOT" <<'PY' || fail "compose/Dockerfile static check"
+import pathlib, sys
+try:
+    import yaml
+except ImportError:
+    yaml = None
+root = pathlib.Path(sys.argv[1])
+df = (root / "Dockerfile").read_text()
+for needle in ("HEALTHCHECK", "uvicorn app.main:app", "EXPOSE"):
+    assert needle in df, f"Dockerfile missing {needle}"
+compose = (root / "docker-compose.yml").read_text()
+if yaml is not None:
+    data = yaml.safe_load(compose)
+    assert "services" in data and "web" in data["services"]
+    assert "healthcheck" in data["services"]["web"]
+    ports = data["services"]["web"]["ports"]
+    assert any("APP_PORT" in p for p in ports), "host port must be configurable"
+print("compose/Dockerfile static check ok")
+PY
+  green "local-equivalent build check ok (docker daemon unavailable)"
+fi
+
+# ---------------------------------------------------------------------------
+step "4/4 boot real uvicorn server and run HTTP smoke"
+BASE_URL="http://127.0.0.1:${APP_PORT}"
+PYTHONPATH="$ROOT/backend" PORT="$APP_PORT" \
+  "$VENV/bin/python" -m uvicorn app.main:app \
+    --host 127.0.0.1 --port "$APP_PORT" \
+    >"$SMOKE_LOG" 2>&1 &
+SERVER_PID=$!
+
+info "waiting for server at $BASE_URL/health"
+ready=0
+for _ in $(seq 1 50); do
+  if "$VENV/bin/python" - "$BASE_URL" <<'PY' 2>/dev/null; then
+import sys, urllib.request
+try:
+    r = urllib.request.urlopen(sys.argv[1] + "/health", timeout=1)
+    sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+PY
+    ready=1; break
+  fi
+  sleep 0.3
+done
+if [ "$ready" != "1" ]; then
+  cat "$SMOKE_LOG"
+  fail "server did not become healthy"
+fi
+
+PYTHONPATH="$ROOT/backend" "$VENV/bin/python" \
+  "$ROOT/scripts/smoke_http.py" "$BASE_URL" || {
+    cat "$SMOKE_LOG"
+    fail "HTTP smoke test"
+  }
+
+# End-to-end page is actually served by the booted API service.
+page_code="$("$VENV/bin/python" - "$BASE_URL" <<'PY'
+import sys, urllib.request
+r = urllib.request.urlopen(sys.argv[1] + "/", timeout=5)
+body = r.read().decode("utf-8", "replace")
+assert r.status == 200 and "精密量块" in body
+print("page-ok")
+PY
+)" || fail "served SPA check"
+info "$page_code"
+
+green "VERIFY PASSED: tests + build + HTTP smoke (preemption & no-solution boundary)"
+exit 0

@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Repository-root entry point for the single-shot verification service.
+# Delegates to scripts/verify (code tests + build checks + HTTP smoke).
+set -euo pipefail
+exec "$(dirname "$0")/scripts/verify" "$@"

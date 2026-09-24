@@ -1,0 +1,21 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: gauge-block-allocation:latest
+    container_name: gauge-block-allocation
+    environment:
+      # Listen port inside the container.
+      PORT: "${INTERNAL_PORT:-8000}"
+    ports:
+      # Host access port is configurable via APP_PORT.
+      - "${APP_PORT:-8000}:${INTERNAL_PORT:-8000}"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import os,sys,urllib.request as u;port=os.environ.get('PORT','8000');r=u.urlopen('http://127.0.0.1:%s/health'%port,timeout=3);sys.exit(0 if r.status==200 else 1)"]
+      interval: 10s
+      timeout: 4s
+      retries: 6
+      start_period: 8s
+    restart: unless-stopped
